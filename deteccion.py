@@ -1,67 +1,51 @@
 import cv2
-import time
 import requests
+import warnings
+import logging
+import os
 from datetime import datetime
 from ultralytics import YOLO
+from ultralytics.utils import LOGGER as ultralytics_logger
 
-# 1. CONFIGURACION - EDITAR ESTOS VALORES
+# Suprimir warnings del modulo warnings de Python
+warnings.filterwarnings("ignore", message=".*not enough matching points.*")
 
-# Datos de tu bot de Telegram
-TELEGRAM_TOKEN = "8191050704:AAGq946Jqw6Ntk7ZhQw-BJgY1ZCiMR3bVeU"
-TELEGRAM_CHAT_ID = "6167866010"
+# Suprimir el WARNING del logger interno de ultralytics
+ultralytics_logger.setLevel(logging.ERROR)
 
-# Horario de toque de queda (formato 24 horas)
-HORA_INICIO_TOQUE_QUEDA = 22   # 10 pm
-HORA_FIN_TOQUE_QUEDA = 4       # 4 am del dia siguiente
+# 1. CONFIGURACION
+TELEGRAM_TOKEN  = "8191050704:AAGq946Jqw6Ntk7ZhQw-BJgY1ZCiMR3bVeU"
+TELEGRAM_CHAT_ID = "-5332802869"   # grupo "Alarma Residencial"
 
-# Cada cuantos segundos como minimo se puede enviar una alerta (para no inundar el chat de Telegram con fotos repetidas)
-COOLDOWN_SEGUNDOS = 30
+HORA_INICIO_TOQUE_QUEDA = 22      # 10 pm
+HORA_FIN_TOQUE_QUEDA    = 4       # 4 am del dia siguiente
 
-# Confianza minima para considerar una deteccion valida (0 a 1)
 CONFIANZA_MINIMA = 0.5
-
-# Indice de la camara (0 = camara principal de la laptop)
-INDICE_CAMARA = 0
-
-# Carpeta donde se guardan las capturas de las alertas
+INDICE_CAMARA    = 0
 CARPETA_CAPTURAS = "capturas"
 
-# 2. CARGAR EL MODELO YOLOv10
+# Cuantos frames consecutivos debe aparecer un ID nuevo
+# antes de considerarlo una deteccion real (evita IDs fantasma de 1 frame)
+FRAMES_CONFIRMACION = 5
 
+# 2. CARGAR MODELO
 print("Cargando modelo YOLOv10...")
 modelo = YOLO("yolov10n.pt")
 print("Modelo cargado correctamente.")
+print(f"Toque de queda: {HORA_INICIO_TOQUE_QUEDA}:00 - {HORA_FIN_TOQUE_QUEDA}:00")
 
-# La clase 0 en el dataset COCO (con el que viene entrenado YOLO) es "person"
 CLASE_PERSONA = 0
 
-
 # 3. FUNCIONES AUXILIARES
-
 def es_horario_toque_queda(hora_actual):
-    """
-    Devuelve True si la hora actual (objeto datetime.time o int de hora)
-    esta dentro del horario de toque de queda.
-    Maneja el caso especial en que el horario cruza la medianoche
-    (ej: de 22 a 4, el rango "envuelve" el dia).
-    """
     hora = hora_actual.hour
-
     if HORA_INICIO_TOQUE_QUEDA > HORA_FIN_TOQUE_QUEDA:
-        # El rango cruza la medianoche, ej: 22 -> 4
         return hora >= HORA_INICIO_TOQUE_QUEDA or hora < HORA_FIN_TOQUE_QUEDA
-    else:
-        # Rango normal, no cruza medianoche
-        return HORA_INICIO_TOQUE_QUEDA <= hora < HORA_FIN_TOQUE_QUEDA
+    return HORA_INICIO_TOQUE_QUEDA <= hora < HORA_FIN_TOQUE_QUEDA
 
 
 def enviar_alerta_telegram(ruta_imagen, mensaje):
-    """
-    Envia una foto + texto al chat de Telegram configurado,
-    usando la API HTTP de Telegram (sendPhoto).
-    """
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto"
-
     try:
         with open(ruta_imagen, "rb") as foto:
             respuesta = requests.post(
@@ -70,87 +54,124 @@ def enviar_alerta_telegram(ruta_imagen, mensaje):
                 files={"photo": foto},
                 timeout=10,
             )
-
         if respuesta.status_code == 200:
-            print("Alerta enviada a Telegram correctamente.")
+            print("Alerta enviada al grupo de Telegram correctamente.")
         else:
-            print(f"Error al enviar a Telegram: {respuesta.status_code} - {respuesta.text}")
-
-    except Exception as error:
-        print(f"Excepcion al enviar a Telegram: {error}")
-
+            print(f"Error Telegram: {respuesta.status_code} - {respuesta.text}")
+    except Exception as e:
+        print(f"Excepcion al enviar a Telegram: {e}")
 
 # 4. PROGRAMA PRINCIPAL
-
 def main():
-    import os
     os.makedirs(CARPETA_CAPTURAS, exist_ok=True)
 
     captura = cv2.VideoCapture(INDICE_CAMARA)
-
     if not captura.isOpened():
-        print("ERROR: No se pudo abrir la camara. Revisa el indice de camara o si otra app la esta usando.")
+        print("ERROR: No se pudo abrir la camara.")
         return
 
-    print("Camara iniciada. Presiona 'q' en la ventana de video para salir.")
+    print("Camara iniciada. Presiona 'q' para salir.")
 
-    ultimo_envio = 0  # marca de tiempo (timestamp) del ultimo envio a Telegram
+    # IDs que ya generaron una alerta
+    ids_alertados = set()
+
+    # Contador de frames en que cada ID ha sido visto (para confirmar que es real y no un ID fantasma)
+    conteo_frames = {}   # {track_id: cantidad_de_frames_visto}
+
+    # Conjunto de IDs vistos en el frame anterior
+    ids_frame_anterior = set()
 
     while True:
         ret, frame = captura.read()
         if not ret:
-            print("No se pudo leer el frame de la camara.")
+            print("No se pudo leer el frame.")
             break
 
         ahora = datetime.now()
         en_toque_de_queda = es_horario_toque_queda(ahora)
 
-        # Corremos la deteccion de YOLO sobre el frame actual
-        resultados = modelo(frame, verbose=False)[0]
+        #Deteccion + tracking
+        resultados = modelo.track(frame, persist=True, verbose=False)[0]
 
-        hay_persona = False
+        # IDs de personas validas detectadas en ESTE frame
+        ids_este_frame = set()
 
-        # Recorremos cada deteccion del frame
         for caja in resultados.boxes:
-            clase_detectada = int(caja.cls[0])
+            if int(caja.cls[0]) != CLASE_PERSONA:
+                continue
+            if float(caja.conf[0]) < CONFIANZA_MINIMA:
+                continue
+            if caja.id is None:
+                continue
+
+            track_id = int(caja.id[0])
+            ids_este_frame.add(track_id)
+
+            # Acumular conteo de frames para este ID
+            conteo_frames[track_id] = conteo_frames.get(track_id, 0) + 1
+
+            # Dibujar caja
+            x1, y1, x2, y2 = map(int, caja.xyxy[0])
             confianza = float(caja.conf[0])
+            color = (0, 0, 255) if en_toque_de_queda else (0, 255, 0)
+            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+            cv2.putText(frame, f"ID:{track_id} {confianza:.2f}",
+                        (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
-            if clase_detectada == CLASE_PERSONA and confianza >= CONFIANZA_MINIMA:
-                hay_persona = True
+        # Limpiar conteo de IDs que ya no estan en camara
+        ids_desaparecidos = set(conteo_frames.keys()) - ids_este_frame
+        for tid in ids_desaparecidos:
+            conteo_frames.pop(tid, None)
 
-                # Dibujamos el rectangulo y la etiqueta sobre el frame
-                x1, y1, x2, y2 = map(int, caja.xyxy[0])
-                color = (0, 0, 255) if en_toque_de_queda else (0, 255, 0)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                texto = f"Persona {confianza:.2f}"
-                cv2.putText(frame, texto, (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        # IDs confirmados (vistos al menos FRAMES_CONFIRMACION frames seguidos)
+        ids_confirmados = {
+            tid for tid in ids_este_frame
+            if conteo_frames.get(tid, 0) >= FRAMES_CONFIRMACION
+        }
 
-        # Texto de estado en la esquina de la ventana
-        estado_texto = "TOQUE DE QUEDA" if en_toque_de_queda else "Horario libre"
-        color_estado = (0, 0, 255) if en_toque_de_queda else (0, 255, 0)
-        cv2.putText(frame, f"{ahora.strftime('%H:%M:%S')} - {estado_texto}",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_estado, 2)
+        # IDs nuevos confirmados que no habian sido alertados antes
+        ids_nuevos = ids_confirmados - ids_alertados
 
-        # Si hay persona Y es horario de toque de queda Y ya paso el cooldown
-        tiempo_actual = time.time()
-        if hay_persona and en_toque_de_queda and (tiempo_actual - ultimo_envio) > COOLDOWN_SEGUNDOS:
-            nombre_archivo = f"{CARPETA_CAPTURAS}/alerta_{ahora.strftime('%Y%m%d_%H%M%S')}.jpg"
+        # Logica de alerta
+        # Solo alertar si hay personas nuevas Y estamos en toque de queda
+        if ids_nuevos and en_toque_de_queda:
+            total_personas = len(ids_confirmados)
+
+            nombre_archivo = (
+                f"{CARPETA_CAPTURAS}/alerta_"
+                f"{ahora.strftime('%Y%m%d_%H%M%S')}"
+                f"_{total_personas}personas.jpg"
+            )
             cv2.imwrite(nombre_archivo, frame)
 
+            ids_nuevos_str = ", ".join(str(i) for i in sorted(ids_nuevos))
             mensaje = (
-                f"ALERTA - Residente fuera de horario\n"
+                f"ALERTA - Residentes fuera de horario\n"
                 f"Fecha y hora: {ahora.strftime('%Y-%m-%d %H:%M:%S')}\n"
-                f"Se detecto una persona durante el toque de queda."
+                f"Personas en camara: {total_personas}\n"
+                f"ID(s) nuevo(s) detectado(s): {ids_nuevos_str}"
             )
 
             enviar_alerta_telegram(nombre_archivo, mensaje)
-            ultimo_envio = tiempo_actual
 
-        # Mostramos la ventana con el video y las detecciones
+            # Marcar todos los IDs nuevos como ya alertados
+            ids_alertados.update(ids_nuevos)
+
+        ids_frame_anterior = ids_este_frame.copy()
+
+        # Texto de estado en pantalla
+        estado = "TOQUE DE QUEDA" if en_toque_de_queda else "Horario libre"
+        color_estado = (0, 0, 255) if en_toque_de_queda else (0, 255, 0)
+        cv2.putText(frame, f"{ahora.strftime('%H:%M:%S')} - {estado}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_estado, 2)
+
+        personas_en_camara = len(ids_confirmados)
+        if personas_en_camara > 0:
+            cv2.putText(frame, f"Personas: {personas_en_camara}",
+                        (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color_estado, 2)
+
         cv2.imshow("Alarma Residencial - YOLOv10", frame)
 
-        # Salir con la tecla 'q'
         if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
