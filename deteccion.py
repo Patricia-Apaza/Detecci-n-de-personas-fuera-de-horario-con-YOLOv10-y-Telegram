@@ -35,7 +35,11 @@ lock_estado = threading.Lock()
 
 print("Cargando arquitectura de Redes Convolucionales (YOLOv10)...")
 modelo = YOLO("yolov10n.pt")
-print("Modelo de IA listo para inferencia.")
+print("Modelo de IA para personas listo.")
+
+# Cargar el detector de rostros nativo de OpenCV (Haar Cascade)
+print("Cargando detector facial secundario...")
+face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + 'haarcascade_frontalface_default.xml')
 
 # 4. CAPA DE ABSTRACCIÓN DE TIEMPO Y GESTIÓN DE TURNOS
 def es_horario_toque_queda(hora_actual):
@@ -110,7 +114,6 @@ def enviar_documento_zip(ruta_zip, titulo, chat_id):
 
 # CONFIGURACIÓN DEL MENÚ NATIVO DE TELEGRAM
 def configurar_menu_comandos():
-    """Registra los comandos del bot en la interfaz nativa de Telegram."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands"
     comandos = [
         {"command": "panel", "description": "Ver estado y alertas del sistema"},
@@ -122,14 +125,11 @@ def configurar_menu_comandos():
         respuesta = requests.post(url, json={"commands": comandos}, timeout=10)
         if respuesta.status_code == 200:
             print("Menú de comandos nativo de Telegram inyectado exitosamente.")
-        else:
-            print(f"No se pudo configurar el menú: {respuesta.text}")
     except Exception as e:
         print(f"[API Error] Falla al conectar con setMyCommands: {e}")
 
 # 6. LOGICA DE COMPRESIÓN ESTRUCTURADA
 def generar_zip_rango_fechas(f_inicio_str, f_fin_str):
-    """Busca turnos que inicien dentro del rango y preserva la estructura de carpetas en el ZIP."""
     try:
         fecha_ini = datetime.strptime(f_inicio_str, "%Y-%m-%d").date()
         fecha_fin = datetime.strptime(f_fin_str, "%Y-%m-%d").date()
@@ -148,10 +148,8 @@ def generar_zip_rango_fechas(f_inicio_str, f_fin_str):
             ruta_carpeta = os.path.join(CARPETA_CAPTURAS, carpeta)
             if os.path.isdir(ruta_carpeta):
                 try:
-                    # Extraer los primeros 10 caracteres (YYYY-MM-DD) correspondientes al inicio del turno
                     fecha_carpeta = datetime.strptime(carpeta[:10], "%Y-%m-%d").date()
                     if fecha_ini <= fecha_carpeta <= fecha_fin:
-                        # MEJORA: Copiar la carpeta completa para mantener la jerarquía en la extracción
                         shutil.copytree(ruta_carpeta, os.path.join(temp_compilacion, carpeta))
                         carpetas_copiadas += 1
                 except Exception:
@@ -199,17 +197,14 @@ def escuchar_telegram():
                     if chat_id_msg != TELEGRAM_CHAT_ID: continue
                     requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery", data={"callback_query_id": cb_id})
                     
-                    # Criterio 1: Descargar Turno Actual (Hoy)
                     if cb_data == "dl_today":
                         nombre_turno = obtener_nombre_turno(datetime.now())
                         ruta_target = os.path.join(CARPETA_CAPTURAS, nombre_turno)
                         
                         if os.path.exists(ruta_target) and os.listdir(ruta_target):
-                            enviar_mensaje_telegram(f"Compoliando registros estructurados para el turno actual (`{nombre_turno}`)...", chat_id_msg)
-                            
+                            enviar_mensaje_telegram(f"Compilando registros estructurados para el turno actual (`{nombre_turno}`)...", chat_id_msg)
                             temp_compilacion = f"temp_hoy_{int(time.time())}"
                             os.makedirs(temp_compilacion, exist_ok=True)
-                            # Preservar carpeta interna
                             shutil.copytree(ruta_target, os.path.join(temp_compilacion, nombre_turno))
                             
                             nombre_zip = f"Reporte_Turno_{nombre_turno}"
@@ -222,7 +217,6 @@ def escuchar_telegram():
                         else:
                             enviar_mensaje_telegram(f"*Sin registros:* No hay evidencias guardadas para el turno activo (`{nombre_turno}`).", chat_id_msg)
                     
-                    # Criterio 2: Flujo Cronológico por Rango
                     elif cb_data == "dl_range":
                         conversaciones[user_id] = {"paso": "dl_esperando_inicio"}
                         enviar_mensaje_telegram(
@@ -232,7 +226,6 @@ def escuchar_telegram():
                             chat_id_msg
                         )
                     
-                    # Limpieza Selectiva por Turnos
                     elif cb_data == "clear_today":
                         nombre_turno = obtener_nombre_turno(datetime.now())
                         ruta_hoy = os.path.join(CARPETA_CAPTURAS, nombre_turno)
@@ -306,11 +299,9 @@ def escuchar_telegram():
                         enviar_mensaje_telegram(f"*REGLAS DE HORARIOS*\nRango actual: {ini:02d}:00 a {fin:02d}:00.\nEscriba la nueva *HORA DE INICIO* (0 a 23):", chat_id_msg)
                         continue
                     
-                    # Máquina de Estados (Configuraciones Asistidas)
                     if user_id in conversaciones:
                         paso = conversaciones[user_id]["paso"]
                         
-                        # --- Flujo Horarios ---
                         if paso == "esperando_inicio":
                             try:
                                 hora_inicio = int(texto_msg)
@@ -334,7 +325,6 @@ def escuchar_telegram():
                             except (ValueError, TypeError):
                                 enviar_mensaje_telegram("*Error:* Ingrese un entero de 0 a 23.", chat_id_msg)
                         
-                        # --- Flujo Rango de Fechas ---
                         elif paso == "dl_esperando_inicio":
                             try:
                                 datetime.strptime(texto_msg, "%Y-%m-%d")
@@ -367,11 +357,8 @@ def escuchar_telegram():
 # 8. LÓGICA PRINCIPAL (NÚCLEO DE VISIÓN COMPUTACIONAL)
 def main():
     os.makedirs(CARPETA_CAPTURAS, exist_ok=True)
-    
-    # 1. Inyectar el menú en la app de Telegram de los clientes
     configurar_menu_comandos()
     
-    # 2. Iniciar el demonio de escucha
     hilo_telegram = threading.Thread(target=escuchar_telegram, daemon=True)
     hilo_telegram.start()
     
@@ -380,9 +367,7 @@ def main():
         print("Error de Hardware: Interfaz de cámara inaccesible.")
         return
     
-    with lock_estado: ini, fin = estado["hora_inicio"], estado["hora_fin"]
     print("Sistema desplegado.")
-    
     
     ids_alertados = set()
     conteo_frames = {}
@@ -418,34 +403,66 @@ def main():
         ids_confirmados = {tid for tid in ids_este_frame if conteo_frames.get(tid, 0) >= FRAMES_CONFIRMACION}
         ids_nuevos = ids_confirmados - ids_alertados
         
-        # Almacenamiento Dinámico Estructurado en base al Turno Operativo
+        # --- NUEVA LÓGICA DE DETECCIÓN Y CORTE DE ROSTROS/CUERPO ---
         if ids_nuevos and en_toque_de_queda:
-            total = len(ids_confirmados)
-            
-            # DETERMINACIÓN DEL NOMBRE DEL TURNO
             nombre_turno_actual = obtener_nombre_turno(ahora)
             carpeta_turno = os.path.join(CARPETA_CAPTURAS, nombre_turno_actual)
             os.makedirs(carpeta_turno, exist_ok=True)
             
-            nombre_archivo = f"{carpeta_turno}/alerta_{ahora.strftime('%H%M%S')}_ids_{total}.jpg"
-            cv2.imwrite(nombre_archivo, frame)
+            # Recorremos las detecciones del frame para ubicar solo a los intrusos nuevos
+            for caja in resultados.boxes:
+                if int(caja.cls[0]) != CLASE_PERSONA or caja.id is None: continue
+                
+                track_id = int(caja.id[0])
+                if track_id in ids_nuevos:
+                    x1, y1, x2, y2 = map(int, caja.xyxy[0])
+                    
+                    # Asegurar que las coordenadas no salgan de los límites del frame
+                    h_frame, w_frame = frame.shape[:2]
+                    x1, y1 = max(0, x1), max(0, y1)
+                    x2, y2 = min(w_frame, x2), min(h_frame, y2)
+                    
+                    # Aislar (recortar) la imagen del cuerpo del intruso
+                    cuerpo_img = frame[y1:y2, x1:x2].copy()
+                    
+                    # Convertir a escala de grises para el detector de rostros
+                    gray_cuerpo = cv2.cvtColor(cuerpo_img, cv2.COLOR_BGR2GRAY)
+                    rostros = face_cascade.detectMultiScale(
+                        gray_cuerpo, 
+                        scaleFactor=1.1, 
+                        minNeighbors=4, 
+                        minSize=(20, 20)
+                    )
+                    
+                    if len(rostros) > 0:
+                        # Si hay rostro, lo encerramos en un cuadro (dibujado sobre el recorte del cuerpo)
+                        for (rx, ry, rw, rh) in rostros:
+                            cv2.rectangle(cuerpo_img, (rx, ry), (rx+rw, ry+rh), (255, 0, 0), 2)
+                        estado_mensaje = "✅ *Se detectó el rostro de la persona.*"
+                    else:
+                        estado_mensaje = "❌ *No se detectó rostro de la persona.*"
+                    
+                    # Guardamos la imagen (el cuerpo recortado, con o sin el cuadro en el rostro)
+                    nombre_archivo = f"{carpeta_turno}/alerta_{ahora.strftime('%H%M%S')}_id_{track_id}.jpg"
+                    cv2.imwrite(nombre_archivo, cuerpo_img)
+                    
+                    mensaje = (
+                        "*ALERTA DE INTRUSIÓN*\n"
+                        f"*Turno Operativo:* `{nombre_turno_actual}`\n"
+                        f"*Hora Exacta:* {ahora.strftime('%H:%M:%S')}\n"
+                        f"*Sujeto:* ID {track_id}\n\n"
+                        f"{estado_mensaje}"
+                    )
+                    
+                    # Enviamos por Telegram individualmente
+                    enviar_alerta_foto(nombre_archivo, mensaje)
             
-            with lock_estado: ini, fin = estado["hora_inicio"], estado["hora_fin"]
-            ids_nuevos_str = ", ".join(str(i) for i in sorted(ids_nuevos))
-            mensaje = (
-                "*INTRUSIÓN EN HORARIO RESTRINGIDO*\n"
-                f"*Turno Operativo:* `{nombre_turno_actual}`\n"
-                f"*Hora Exacta:* {ahora.strftime('%H:%M:%S')}\n"
-                f"*Personas Confirmadas:* {total} en escena\n"
-                f"*Identificadores:* ID [{ids_nuevos_str}]\n"
-            )
-            enviar_alerta_foto(nombre_archivo, mensaje)
+            # Registramos todos los nuevos como alertados
             ids_alertados.update(ids_nuevos)
-        
+            
         if not en_toque_de_queda: ids_alertados.clear()
             
         # Interfaz Gráfica Local (HUD de Monitoreo)
-        with lock_estado: ini, fin = estado["hora_inicio"], estado["hora_fin"]
         turno_hud = obtener_nombre_turno(ahora)
         estado_txt = f"TOQUE DE QUEDA ACTIVO | TURNO: {turno_hud}" if en_toque_de_queda else "ACCESO PERMITIDO"
         color_hud = (0, 0, 255) if en_toque_de_queda else (0, 255, 0)
